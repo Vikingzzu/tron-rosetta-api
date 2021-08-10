@@ -351,10 +351,13 @@ public class BlockApiController implements BlockApi {
   }
 
 
-  private List<TransactionBalanceTrace.Operation> removeBlackHole(List<TransactionBalanceTrace.Operation> operations){
+  private List<TransactionBalanceTrace.Operation> removeUselessOperations(List<TransactionBalanceTrace.Operation> operations){
     List<TransactionBalanceTrace.Operation> result = new LinkedList<>();
     for (BalanceContract.TransactionBalanceTrace.Operation op : operations) {
-      if (op.getAddress().toByteArray().equals(chainBaseManager.getAccountStore().getBlackholeAddress())) {
+      if (Arrays.equals(op.getAddress().toByteArray(),chainBaseManager.getAccountStore().getBlackholeAddress())) {
+        continue;
+      }
+      if (op.getAmount()==0) {
         continue;
       }
       result.add(op);
@@ -367,11 +370,11 @@ public class BlockApiController implements BlockApi {
       return toRosettaGenesisTx(transactionBalanceTrace);
     }
     if (transactionBalanceTrace.getType().equals(ContractType.TransferContract.name())) {
-      return toRosettaTransferTx(transactionBalanceTrace);
+      return toRosettaTransferTx(transactionBalanceTrace,transaction);
     }
     if (transactionBalanceTrace.getType().equals(ContractType.CreateSmartContract.name()) ||
         transactionBalanceTrace.getType().equals(ContractType.TriggerSmartContract.name())) {
-      return toRosettaVmTx(transactionBalanceTrace);
+      return toRosettaVmTx(transactionBalanceTrace,transaction);
     }
     return toRosettaOtherTx(transactionBalanceTrace,transaction);
   }
@@ -397,69 +400,83 @@ public class BlockApiController implements BlockApi {
     return rstTx;
   }
 
-  private org.tron.model.Transaction toRosettaTransferTx(BalanceContract.TransactionBalanceTrace transactionBalanceTrace){
-    //1. set tx
-    org.tron.model.Transaction rstTx = new org.tron.model.Transaction()
-        .transactionIdentifier(new org.tron.model.TransactionIdentifier()
-            .hash(ByteArray.toHexString(transactionBalanceTrace.getTransactionIdentifier().toByteArray())));
-    //2. set operations
-    int feeOperationCount = 0;
-    List<BalanceContract.TransactionBalanceTrace.Operation> operations = removeBlackHole(transactionBalanceTrace.getOperationList());
-    if (operations.size() > 2) {
-      feeOperationCount = operations.size()-2;
-    }
-    for (BalanceContract.TransactionBalanceTrace.Operation op : operations) {
-      long index = op.getOperationIdentifier();
-      if (index < feeOperationCount) {
-        continue;
-      }
-      index = index - feeOperationCount;
-      org.tron.model.Operation operation = new org.tron.model.Operation()
-          .operationIdentifier(new OperationIdentifier().index(index))
-          .type(transactionBalanceTrace.getType())
-          .status(transactionBalanceTrace.getStatus())
-          .amount(new Amount().currency(Default.CURRENCY).value(Long.toString(op.getAmount())))
-          .account(new AccountIdentifier().address(encode58Check(op.getAddress().toByteArray())));
-
-      if (1 == index % 2) {
-        operation.addRelatedOperationsItem(new OperationIdentifier().index(index - 1));
-      }
-      rstTx.addOperationsItem(operation);
-    }
-    if (feeOperationCount != 0) {
-      BalanceContract.TransactionBalanceTrace.Operation op = operations.get(0);
-      rstTx.addOperationsItem(new org.tron.model.Operation()
-          .operationIdentifier(new OperationIdentifier().index((long)(rstTx.getOperations().size())))
-          .type("Fee")
-          .status(transactionBalanceTrace.getStatus())
-          .amount(new Amount().currency(Default.CURRENCY).value(Long.toString(op.getAmount())))
-          .account(new AccountIdentifier().address(encode58Check(op.getAddress().toByteArray()))));
-    }
-    return rstTx;
-  }
-
-  private org.tron.model.Transaction toRosettaVmTx(BalanceContract.TransactionBalanceTrace transactionBalanceTrace){
-    long energyFee = 0;
-    long netFee = 0;
-    long fee = 0;
-    String txid = ByteArray.toHexString(transactionBalanceTrace.getTransactionIdentifier().toByteArray());
+  private org.tron.model.Transaction toRosettaTransferTx(BalanceContract.TransactionBalanceTrace transactionBalanceTrace,TransactionCapsule transaction){
     Protocol.TransactionInfo reply = wallet.getTransactionInfoById(transactionBalanceTrace.getTransactionIdentifier());
+    long fee = 0;
     if (reply != null) {
-      energyFee = reply.getReceipt().getEnergyFee();
-      netFee = reply.getReceipt().getNetFee();
       fee = -reply.getFee();
     }
     //1. set tx
     org.tron.model.Transaction rstTx = new org.tron.model.Transaction()
         .transactionIdentifier(new org.tron.model.TransactionIdentifier()
             .hash(ByteArray.toHexString(transactionBalanceTrace.getTransactionIdentifier().toByteArray())));
+
     //2. set operations
-    List<BalanceContract.TransactionBalanceTrace.Operation> operations = removeBlackHole(transactionBalanceTrace.getOperationList());
+    BalanceContract.TransferContract transferContract = transaction.getTransferContract();
+    if (transferContract!=null) {
+      rstTx.addOperationsItem(new org.tron.model.Operation()
+          .operationIdentifier(new OperationIdentifier().index(0L))
+          .type("TransferContract")
+          .status(transactionBalanceTrace.getStatus())
+          .amount(new Amount().currency(Default.CURRENCY).value(Long.toString(-transferContract.getAmount())))
+          .account(new AccountIdentifier().address(encode58Check(transferContract.getOwnerAddress().toByteArray()))));
+      rstTx.addOperationsItem(new org.tron.model.Operation()
+          .operationIdentifier(new OperationIdentifier().index(1L))
+          .addRelatedOperationsItem(new OperationIdentifier().index(0L))
+          .type("TransferContract")
+          .status(transactionBalanceTrace.getStatus())
+          .amount(new Amount().currency(Default.CURRENCY).value(Long.toString(transferContract.getAmount())))
+          .account(new AccountIdentifier().address(encode58Check(transferContract.getToAddress().toByteArray()))));
+    }
+    if (fee != 0) {
+      rstTx.addOperationsItem(new org.tron.model.Operation()
+          .operationIdentifier(new OperationIdentifier().index((long)(rstTx.getOperations().size())))
+          .type("Fee")
+          .status(transactionBalanceTrace.getStatus())
+          .amount(new Amount().currency(Default.CURRENCY).value(Long.toString(fee)))
+          .account(new AccountIdentifier().address(encode58Check(transferContract.getOwnerAddress().toByteArray()))));
+    }
+    return rstTx;
+  }
+
+  private org.tron.model.Transaction toRosettaVmTx(BalanceContract.TransactionBalanceTrace transactionBalanceTrace,
+                                                   TransactionCapsule transaction){
+    long energyFee = 0;
+    long netFee = 0;
+    long multiSignFee = 0;
+    long fee = 0;
+    String txid = ByteArray.toHexString(transactionBalanceTrace.getTransactionIdentifier().toByteArray());
+    Protocol.TransactionInfo reply = wallet.getTransactionInfoById(transactionBalanceTrace.getTransactionIdentifier());
+    if (reply != null) {
+      energyFee = reply.getReceipt().getEnergyFee();
+      netFee = reply.getReceipt().getNetFee();
+      multiSignFee = reply.getFee()- energyFee - netFee - transaction.getInstance().getRet(0).getFee();
+    }
+    //1. set tx
+    org.tron.model.Transaction rstTx = new org.tron.model.Transaction()
+        .transactionIdentifier(new org.tron.model.TransactionIdentifier()
+            .hash(ByteArray.toHexString(transactionBalanceTrace.getTransactionIdentifier().toByteArray())));
+    //2. set operations
+    List<BalanceContract.TransactionBalanceTrace.Operation> operations = removeUselessOperations(transactionBalanceTrace.getOperationList());
 
     String feeAddress = "";
     for (BalanceContract.TransactionBalanceTrace.Operation op : operations) {
-      if (op.getAmount() == -1 * energyFee || op.getAmount() == -1 * netFee) {
+      if (energyFee != 0 && op.getAmount() == -1 * energyFee) {
         feeAddress = encode58Check(op.getAddress().toByteArray());
+        fee += op.getAmount();
+        energyFee = 0;
+        continue;
+      }
+      if (netFee != 0 && op.getAmount() == -1 * netFee) {
+        feeAddress = encode58Check(op.getAddress().toByteArray());
+        fee += op.getAmount();
+        netFee = 0;
+        continue;
+      }
+      if (multiSignFee != 0 && op.getAmount() == -1 * multiSignFee) {
+        feeAddress = encode58Check(op.getAddress().toByteArray());
+        fee += op.getAmount();
+        multiSignFee = 0;
         continue;
       }
       long curIndex = rstTx.getOperations().size();
@@ -487,25 +504,25 @@ public class BlockApiController implements BlockApi {
         .transactionIdentifier(new org.tron.model.TransactionIdentifier()
             .hash(ByteArray.toHexString(transactionBalanceTrace.getTransactionIdentifier().toByteArray())));
 
-    List<BalanceContract.TransactionBalanceTrace.Operation> operations = removeBlackHole(transactionBalanceTrace.getOperationList());
+    List<BalanceContract.TransactionBalanceTrace.Operation> operations = removeUselessOperations(transactionBalanceTrace.getOperationList());
     int transactionCount = getTransOperationCount(transaction.getInstance().getRawData().getContract(0));
     int feeOperationCount = operations.size() - transactionCount;
     if (transactionBalanceTrace.getType().equals(ContractType.MarketSellAssetContract.name()) ||
         transactionBalanceTrace.getType().equals(ContractType.MarketCancelOrderContract.name())) {
       feeOperationCount = 0;
     }
-    int fee = 0;
+    long fee = 0;
     String feeAddress = "";
     for (BalanceContract.TransactionBalanceTrace.Operation op : operations) {
       long index = op.getOperationIdentifier();
       if (index < feeOperationCount) {
         fee += op.getAmount();
-        if (feeAddress.equals("")) {
+        if ("".equals(feeAddress)) {
           feeAddress = encode58Check(op.getAddress().toByteArray());
         }
         continue;
       }
-      index = index - feeOperationCount;
+      index = rstTx.getOperations().size();
       org.tron.model.Operation operation = new org.tron.model.Operation()
           .operationIdentifier(new OperationIdentifier().index(index))
           .type(transactionBalanceTrace.getType())
